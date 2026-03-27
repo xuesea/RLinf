@@ -499,6 +499,50 @@ class Worker(metaclass=WorkerMeta):
         Worker.current_worker = self
         self._has_initialized = True
 
+    def _ensure_model_registry_if_needed(self) -> None:
+        """Run external ``register_all()`` in Ray workers when configured.
+
+        Subclasses that define ``init_worker`` are wrapped via ``__init_subclass__`` so
+        each worker process repopulates :class:`~rlinf.models.registry.ModelRegistry`
+        when ``runner.model_registry_init_module`` or ``RLINF_MODEL_REGISTRY_INIT_MODULE``
+        is set.
+        """
+        cfg = getattr(self, "cfg", None)
+        if cfg is None or not OmegaConf.is_config(cfg):
+            return
+        from rlinf.models.registry import ensure_model_registry_from_cfg
+
+        ensure_model_registry_from_cfg(cfg)
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "init_worker" not in cls.__dict__:
+            return
+        original = cls.__dict__["init_worker"]
+        if getattr(original, "_rlinf_model_registry_wrapped", False):
+            return
+
+        if inspect.iscoroutinefunction(original):
+
+            async def init_worker(self, *args, **kwargs):
+                self._ensure_model_registry_if_needed()
+                return await original(self, *args, **kwargs)
+
+            wrapper = init_worker
+        else:
+
+            def init_worker(self, *args, **kwargs):
+                self._ensure_model_registry_if_needed()
+                return original(self, *args, **kwargs)
+
+            wrapper = init_worker
+
+        wrapper.__name__ = getattr(original, "__name__", "init_worker")
+        wrapper.__qualname__ = getattr(original, "__qualname__", "init_worker")
+        wrapper.__doc__ = getattr(original, "__doc__", None)
+        wrapper._rlinf_model_registry_wrapped = True
+        setattr(cls, "init_worker", wrapper)
+
     @property
     def has_accelerator(self) -> bool:
         """Whether the worker has been allocated with accelerators."""

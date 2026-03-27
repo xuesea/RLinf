@@ -19,7 +19,66 @@ from rlinf.scheduler import Worker
 
 
 def get_model(cfg: DictConfig):
-    model_type = get_supported_model(cfg.model_type)
+    model_type_str = cfg.get("model_type", None)
+    if model_type_str is None:
+        return None
+
+    from rlinf.models.registry import ModelRegistry
+
+    registered = ModelRegistry.get(model_type_str)
+    if registered is not None:
+        get_model_fn, _ = registered
+        torch_dtype = torch_dtype_from_precision(cfg.precision)
+        model = get_model_fn(cfg, torch_dtype)
+        if Worker.torch_platform.is_available():
+            model = model.to(Worker.torch_device_type)
+        if cfg.get("is_lora", False):
+            from peft import LoraConfig, PeftModel, get_peft_model
+
+            resolved = get_supported_model(model_type_str)
+            if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
+                lora_config = LoraConfig(
+                    r=cfg.lora_rank,
+                    lora_alpha=cfg.lora_rank,
+                    lora_dropout=0.0,
+                    target_modules=[
+                        "proj",
+                        "qkv",
+                        "fc1",
+                        "fc2",
+                        "q",
+                        "kv",
+                        "fc3",
+                        "out_proj",
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "o_proj",
+                        "gate_proj",
+                        "up_proj",
+                        "down_proj",
+                        "lm_head",
+                    ],
+                    init_lora_weights="gaussian",
+                )
+                if resolved == SupportedModel.OPENPI:
+                    module_to_lora = model.paligemma_with_expert.paligemma
+                    module_to_lora = get_peft_model(module_to_lora, lora_config)
+                    tag_vlm_subtree(model, False)
+                    tag_vlm_subtree(module_to_lora, True)
+                    model.paligemma_with_expert.paligemma = module_to_lora
+                else:
+                    model = get_peft_model(model, lora_config)
+            else:
+                model = PeftModel.from_pretrained(model, cfg.lora_path, is_trainable=True)
+
+            if hasattr(model, "value_head"):
+                for param in model.value_head.parameters():
+                    param.requires_grad = True
+
+        return model
+
+    model_type = get_supported_model(model_type_str)
     if model_type == SupportedModel.OPENVLA:
         from rlinf.models.embodiment.openvla import get_model
     elif model_type == SupportedModel.OPENVLA_OFT:
@@ -27,7 +86,11 @@ def get_model(cfg: DictConfig):
     elif model_type == SupportedModel.OPENPI:
         from rlinf.models.embodiment.openpi import get_model
     elif model_type == SupportedModel.DEXBOTIC_PI:
-        from rlinf.models.embodiment.dexbotic_pi import get_model
+        raise RuntimeError(
+            "model_type 'dexbotic_pi' is implemented in the Dexbotic package, not RLinf. "
+            "Call `dexbotic.rl.rlinf_registry.register_all()` (or "
+            "`ModelRegistry.register('dexbotic_pi', loader, force=True)`) before training."
+        )
     elif model_type == SupportedModel.MLP_POLICY:
         from rlinf.models.embodiment.mlp_policy import get_model
     elif model_type == SupportedModel.GR00T:

@@ -30,7 +30,7 @@ from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     kl_penalty,
 )
-from rlinf.config import SupportedModel, torch_dtype_from_precision
+from rlinf.config import SupportedModel, get_supported_model, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
@@ -1207,7 +1207,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return rollout_metrics
 
     def _build_sft_data_loader(self):
-        if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
+        if get_supported_model(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
             # NOTE: This must be set before importing openpi.training.data_loader
             if self.cfg.actor.get("sft_data_path", None):
                 os.environ["HF_LEROBOT_HOME"] = self.cfg.actor.sft_data_path
@@ -1380,7 +1380,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     forward_inputs = batch.get("forward_inputs", None)
 
                     kwargs = {}
-                    if SupportedModel(self.cfg.actor.model.model_type) in [
+                    actor_model_type = get_supported_model(self.cfg.actor.model.model_type)
+                    if actor_model_type in [
                         SupportedModel.OPENVLA,
                         SupportedModel.OPENVLA_OFT,
                     ]:
@@ -1388,10 +1389,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             self.cfg.algorithm.sampling_params.temperature_train
                         )
                         kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
-                    elif (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
+                    elif actor_model_type == SupportedModel.GR00T:
                         kwargs["prev_logprobs"] = prev_logprobs
 
                     compute_values = (
@@ -1408,10 +1406,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             **kwargs,
                         )
 
-                    if (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
+                    if actor_model_type == SupportedModel.GR00T:
                         prev_logprobs = output_dict["prev_logprobs"]
 
                     kwargs = {

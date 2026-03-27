@@ -21,7 +21,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 
-from rlinf.config import SupportedModel
+from rlinf.config import SupportedModel, get_supported_model
 from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
@@ -205,7 +205,8 @@ class MultiStepRolloutWorker(Worker):
             else self._eval_sampling_params
         )
 
-        if SupportedModel(self.cfg.actor.model.model_type) in [
+        actor_model_type = get_supported_model(self.cfg.actor.model.model_type)
+        if actor_model_type in [
             SupportedModel.OPENPI,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
@@ -213,7 +214,7 @@ class MultiStepRolloutWorker(Worker):
         ]:
             kwargs = {"mode": mode}
 
-        if SupportedModel(self.cfg.actor.model.model_type) in [
+        if actor_model_type in [
             SupportedModel.CNN_POLICY,
             SupportedModel.FLOW_POLICY,
             SupportedModel.MLP_POLICY,

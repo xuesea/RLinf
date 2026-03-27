@@ -17,7 +17,7 @@ import torch
 from omegaconf import DictConfig
 from torch.utils import _pytree
 
-from rlinf.config import SupportedModel
+from rlinf.config import SupportedModel, get_supported_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.utils.pytree import register_pytree_dataclasses
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
@@ -28,7 +28,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         super().__init__(cfg)
 
     def build_dataloader(self, data_paths: list[str], eval_dataset: bool = False):
-        if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
+        if get_supported_model(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
             import openpi.training.data_loader as openpi_data_loader
 
             from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config

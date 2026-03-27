@@ -58,6 +58,8 @@ class SupportedModel(Enum):
     CNN_POLICY = ("cnn_policy", "embodied")
     FLOW_POLICY = ("flow_policy", "embodied")
     CMA_POLICY = ("cma", "embodied")
+    # Resolved when model_type is registered via ModelRegistry (external package)
+    REGISTRY_EXTERNAL = ("registry_external", "embodied")
 
     # Sft models
     QWEN2_5_VL_SFT = ("qwen2.5_vl", "sft")
@@ -72,6 +74,10 @@ class SupportedModel(Enum):
 
 
 def get_supported_model(model_type: str) -> SupportedModel:
+    from rlinf.models.registry import ModelRegistry
+
+    if ModelRegistry.get(model_type) is not None:
+        return SupportedModel.REGISTRY_EXTERNAL
     try:
         return SupportedModel(model_type)
     except ValueError as err:

@@ -1,0 +1,63 @@
+# 任务名称
+TaskName: "dexbotic-training"
+# 任务描述
+Description: "Training Dexbotic"
+# 入口命令
+Entrypoint: "sleep 10d"
+# 标签
+Tags: ["rlinf", "training"]
+# 本地的代码路径，如是目录且以 '/' 结尾，则将该目录下的所有内容上传到 RemoteMountCodePath，如是目录且不以 '/' 结尾，则将该目录及该目录下
+# 所有内容上传到 RemoteMountCodePath.
+# 上传规则会跳过隐藏目录和 .gitignore 中的文件和目录
+# UserCodePath: "./"
+# 容器中的代码挂载路径
+# RemoteMountCodePath: "/root/code/dexbotic"
+
+# 镜像 URL 地址
+ImageUrl: "dexmalhub-cn-beijing.cr.volces.com/xb/robotics-rlinf-h20:v0.1"
+# 队列 ID，为空时使用公共队列
+ResourceQueueID: "q-20260129103829-bdfv8"
+# 训练框架，支持 TensorFlowPS / PyTorchDDP / MPI / BytePS / Custom
+Framework: "Custom"
+# 实例配置，包含角色名称（RoleName）、角色数量（RoleReplicas）以及具体的实例规格（Flavor）
+TaskRoleSpecs:
+  - RoleName: worker
+    RoleReplicas: 1
+    Flavor: "ml.pni3ln.4xlarge"
+# 最长运行时间
+ActiveDeadlineSeconds:  864000
+# 实例保留时长
+DelayExitTimeSeconds: 0
+# 可见范围，支持 Public / Queue / Private
+AccessType: "Public"
+Preemptible: false
+Priority: 4
+# 自动重试
+RetryOptions:
+    EnableRetry: false
+    MaxRetryTimes: 5
+    IntervalSeconds: 120
+    PolicySets:
+        - "Failed"
+# 任务诊断策略
+DiagOptions:
+  - Name: "EnvironmentalDiagnosis"
+    Enable: false
+  - Name: "PythonDetection"
+    Enable: true
+    PythonDetectionInterval: 3600
+  - Name: "LogDetection"
+    Enable: true
+    LogDetectionInterval: 1800
+# 挂载数据盘至训练容器中
+Storages:
+  # - Type: TosFuse
+  #   MountPath: /dexmal-fa-zyc-model
+  #   Bucket: dexmal-fa-zyc-model
+  #   Prefix: /
+  - Type: Vepfs
+    MountPath: /mlp_vepfs/share
+    ReadOnly: false
+    SubPath: share
+    VepfsId: vepfs-cnbj391087bcabac
+
