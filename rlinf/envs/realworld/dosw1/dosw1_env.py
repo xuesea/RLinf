@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import enum
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -27,7 +28,10 @@ import gymnasium as gym
 import numpy as np
 
 from rlinf.envs.realworld.common.camera import BaseCamera, CameraInfo, create_camera
-from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListener
+from rlinf.envs.realworld.common.keyboard.keyboard_listener import (
+    FileKeyboardListener,
+    KeyboardListener,
+)
 from rlinf.envs.realworld.common.video_player import VideoPlayer
 from rlinf.scheduler import DOSW1HWInfo, WorkerInfo
 from rlinf.utils.logging import get_logger
@@ -58,11 +62,16 @@ class DOSW1Config:
     right_arm_port: int = 50053
     left_lead_port: int = 50050
     right_lead_port: int = 50052
+    sdk_backend: str = "auto"
 
     camera_serials: Optional[list[str]] = None
     camera_names: list[str] = field(
         default_factory=lambda: ["cam_front", "cam_left", "cam_right"]
     )
+    image_height: int = IMAGE_H
+    image_width: int = IMAGE_W
+    image_resize_mode: str = "center_crop"
+    image_debug_dump_dir: Optional[str] = None
     enable_camera_player: bool = True
     is_dummy: bool = False
 
@@ -87,6 +96,7 @@ class DOSW1Config:
 
     max_joint_delta: float = float("inf")
     action_scale: float = 1.0
+    action_debug_interval: int = 0
 
     left_ee_pose_limit_min: np.ndarray = field(
         default_factory=lambda: np.full(3, -np.inf)
@@ -106,6 +116,8 @@ class DOSW1Config:
 
     enable_human_in_loop: bool = False
     manual_episode_control_only: bool = False
+    keyboard_fallback_file: Optional[str] = None
+    require_keyboard_device: bool = False
     gripper_factor: float = 0.07 / 0.048
     gripper_teleop_scale: float = 5.0
 
@@ -159,7 +171,7 @@ class DOSW1Env(gym.Env):
         self.manual_done: bool = False
         self._leader_follow_enabled: bool = False
         if config.enable_human_in_loop:
-            self._keyboard = KeyboardListener()
+            self._keyboard = self._create_keyboard_listener()
             self.in_free_teleop = True
             self._leader_follow_enabled = True
 
@@ -173,6 +185,30 @@ class DOSW1Env(gym.Env):
         if not config.is_dummy:
             self.robot_state = self.sdk.get_state()
 
+    def _create_keyboard_listener(self):
+        try:
+            listener = KeyboardListener()
+            device_path = getattr(getattr(listener, "device", None), "path", "unknown")
+            self._logger.info("[DOSW1Env] Keyboard control device: %s", device_path)
+            return listener
+        except RuntimeError as exc:
+            if bool(getattr(self.config, "require_keyboard_device", False)):
+                raise
+            listener = FileKeyboardListener(
+                getattr(self.config, "keyboard_fallback_file", None)
+            )
+            self._logger.warning(
+                "[DOSW1Env] Keyboard device unavailable: %s. "
+                "Falling back to file controls at %s. "
+                "Use commands like: echo s > %s, echo d > %s, echo r > %s.",
+                exc,
+                listener.path,
+                listener.path,
+                listener.path,
+                listener.path,
+            )
+            return listener
+
     def reset(
         self,
         *,
@@ -185,8 +221,18 @@ class DOSW1Env(gym.Env):
 
         options = options or {}
         skip_wait_for_start = bool(options.get("skip_wait_for_start", False))
+        reset_to_home = bool(options.get("reset_to_home", False))
 
         if self.config.enable_human_in_loop:
+            if reset_to_home:
+                self._logger.info(
+                    "[DOSW1Env] Resetting robot to home before free-teleop start wait."
+                )
+                self.in_free_teleop = False
+                self._set_leader_follow_enabled(
+                    enabled=False, source="reset_to_home"
+                )
+                self._go_to_home()
             self.in_free_teleop = True
             self.start_episode_requested = False
             self._set_leader_follow_enabled(
@@ -404,6 +450,42 @@ class DOSW1Env(gym.Env):
         actual[6] = left_gripper
         actual[7:13] = right_joint
         actual[13] = right_gripper
+
+        debug_interval = int(getattr(cfg, "action_debug_interval", 0) or 0)
+        if debug_interval > 0 and self._num_steps % debug_interval == 0:
+            raw_left_delta = action[:6] - cur_left
+            raw_right_delta = action[7:13] - cur_right
+            cmd_left_delta = left_joint - cur_left
+            cmd_right_delta = right_joint - cur_right
+            self._logger.info(
+                "[DOSW1ActionDebug] step=%s "
+                "raw_left_norm=%.4f raw_left_max=%.4f "
+                "cmd_left_norm=%.4f cmd_left_max=%.4f "
+                "raw_right_norm=%.4f raw_right_max=%.4f "
+                "cmd_right_norm=%.4f cmd_right_max=%.4f "
+                "gripper_action=(%.4f, %.4f) gripper_cmd=(%.4f, %.4f) "
+                "cur_left=%s action_left=%s cmd_left=%s "
+                "cur_right=%s action_right=%s cmd_right=%s",
+                self._num_steps,
+                float(np.linalg.norm(raw_left_delta)),
+                float(np.max(np.abs(raw_left_delta))),
+                float(np.linalg.norm(cmd_left_delta)),
+                float(np.max(np.abs(cmd_left_delta))),
+                float(np.linalg.norm(raw_right_delta)),
+                float(np.max(np.abs(raw_right_delta))),
+                float(np.linalg.norm(cmd_right_delta)),
+                float(np.max(np.abs(cmd_right_delta))),
+                float(action[6]),
+                float(action[13]),
+                left_gripper,
+                right_gripper,
+                np.round(cur_left, 4).tolist(),
+                np.round(action[:6], 4).tolist(),
+                np.round(left_joint, 4).tolist(),
+                np.round(cur_right, 4).tolist(),
+                np.round(action[7:13], 4).tolist(),
+                np.round(right_joint, 4).tolist(),
+            )
         return actual
 
     def _execute_pause_action(self) -> np.ndarray:
@@ -561,6 +643,8 @@ class DOSW1Env(gym.Env):
 
     def _init_action_obs_spaces(self) -> None:
         camera_names = self.effective_camera_names()
+        image_height = int(self.config.image_height)
+        image_width = int(self.config.image_width)
         gripper_low = float(self.config.gripper_width_min)
         gripper_high = float(self.config.gripper_width_max)
         action_low = np.full(ACTION_DIM, -np.pi, dtype=np.float32)
@@ -600,7 +684,7 @@ class DOSW1Env(gym.Env):
                         name: gym.spaces.Box(
                             0,
                             255,
-                            shape=(IMAGE_H, IMAGE_W, 3),
+                            shape=(image_height, image_width, 3),
                             dtype=np.uint8,
                         )
                         for name in camera_names
@@ -636,6 +720,14 @@ class DOSW1Env(gym.Env):
             camera = create_camera(CameraInfo(name=name, serial_number=serial))
             camera.open()
             self._cameras.append(camera)
+            self._logger.info(
+                "[DOSW1Env] Opened camera name=%s serial=%s output_size=%sx%s resize_mode=%s",
+                name,
+                serial,
+                int(self.config.image_width),
+                int(self.config.image_height),
+                str(self.config.image_resize_mode),
+            )
 
     def _close_cameras(self) -> None:
         for camera in self._cameras:
@@ -645,18 +737,45 @@ class DOSW1Env(gym.Env):
     def _get_camera_frames(self) -> dict[str, np.ndarray]:
         frames: dict[str, np.ndarray] = {}
         display_frames: dict[str, np.ndarray] = {}
+        image_height = int(self.config.image_height)
+        image_width = int(self.config.image_width)
+        resize_mode = str(self.config.image_resize_mode)
         for camera in self._cameras:
-            frame_rgb = camera.get_frame()
-            height, width = frame_rgb.shape[:2]
-            crop = min(height, width)
-            start_x = (width - crop) // 2
-            start_y = (height - crop) // 2
-            cropped = frame_rgb[start_y : start_y + crop, start_x : start_x + crop]
-            resized = cv2.resize(cropped, (IMAGE_W, IMAGE_H))
+            frame_bgr = camera.get_frame()
+            if resize_mode in {"stretch", "direct"}:
+                resized = cv2.resize(frame_bgr, (image_width, image_height))
+            elif resize_mode == "center_crop":
+                height, width = frame_bgr.shape[:2]
+                crop = min(height, width)
+                start_x = (width - crop) // 2
+                start_y = (height - crop) // 2
+                cropped = frame_bgr[start_y : start_y + crop, start_x : start_x + crop]
+                resized = cv2.resize(cropped, (image_width, image_height))
+            else:
+                raise ValueError(
+                    "Unsupported image_resize_mode="
+                    f"{resize_mode!r}; expected 'center_crop' or 'stretch'."
+                )
             frames[camera.name] = resized[..., ::-1]
             display_frames[camera.name] = resized
         self._camera_player.put_frame(display_frames)
+        self._maybe_dump_debug_frames(frames)
         return frames
+
+    def _maybe_dump_debug_frames(self, frames: dict[str, np.ndarray]) -> None:
+        dump_dir = getattr(self.config, "image_debug_dump_dir", None)
+        if not dump_dir or getattr(self, "_debug_images_dumped", False):
+            return
+        os.makedirs(dump_dir, exist_ok=True)
+        for name, frame_rgb in frames.items():
+            path = os.path.join(dump_dir, f"{name}.png")
+            cv2.imwrite(path, frame_rgb[..., ::-1])
+        self._debug_images_dumped = True
+        self._logger.info(
+            "[DOSW1Env] Dumped one RGB camera frame set to %s keys=%s",
+            dump_dir,
+            sorted(frames),
+        )
 
     @staticmethod
     def _discover_camera_serials() -> list[str]:

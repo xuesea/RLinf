@@ -23,6 +23,73 @@ from rlinf.utils.logging import get_logger
 _logger = get_logger()
 
 
+class FileKeyboardListener:
+    """Keyboard-compatible listener driven by a small command file.
+
+    This is useful on real robot hosts where the Ray worker user cannot read
+    /dev/input/event*.  Write a command character to the file, for example:
+
+        echo s > /tmp/rlinf_dosw1_key
+
+    The command is consumed once by get_key() / pop_pressed_keys().
+    """
+
+    def __init__(self, path: str | None = None):
+        self.path = path or os.environ.get(
+            "RLINF_KEYBOARD_FALLBACK_FILE", "/tmp/rlinf_dosw1_key"
+        )
+        self.state_lock = threading.Lock()
+        self.latest_data = {"key": None}
+        self._press_events: deque[str] = deque()
+        self.listener = None
+        self._ensure_file()
+
+    def _ensure_file(self) -> None:
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(self.path, "a", encoding="utf-8"):
+            pass
+        try:
+            os.chmod(self.path, 0o666)
+        except OSError:
+            pass
+
+    def _drain_file(self) -> list[str]:
+        self._ensure_file()
+        try:
+            with open(self.path, "r+", encoding="utf-8") as handle:
+                data = handle.read()
+                handle.seek(0)
+                handle.truncate()
+        except FileNotFoundError:
+            return []
+        keys = []
+        for token in data.replace(",", " ").split():
+            if token:
+                keys.append(token[0].lower())
+        return keys
+
+    def get_key(self) -> str | None:
+        with self.state_lock:
+            if not self._press_events:
+                self._press_events.extend(self._drain_file())
+            if not self._press_events:
+                self.latest_data["key"] = None
+                return None
+            key = self._press_events.popleft()
+            self.latest_data["key"] = key
+            return key
+
+    def pop_pressed_keys(self) -> list[str]:
+        with self.state_lock:
+            self._press_events.extend(self._drain_file())
+            pressed = list(self._press_events)
+            self._press_events.clear()
+            self.latest_data["key"] = None
+            return pressed
+
+
 class KeyboardListener:
     """Headless keyboard listener backed by Linux evdev input devices."""
 

@@ -68,6 +68,7 @@ class EnvWorker(Worker):
         self.last_obs_list = []
         self.last_intervened_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
+        self._reset_before_next_train_bootstrap = False
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
@@ -113,6 +114,21 @@ class EnvWorker(Worker):
             train_env_cfg.get("enable_offload", False)
             if train_env_cfg is not None
             else False
+        )
+        self.reset_before_train_rollout = (
+            train_env_cfg.get("reset_before_rollout", False)
+            if train_env_cfg is not None
+            else False
+        )
+        self.reset_to_home_before_train_rollout = (
+            train_env_cfg.get("reset_to_home_before_rollout", False)
+            if train_env_cfg is not None
+            else False
+        )
+        self.wait_for_start_before_train_rollout = (
+            train_env_cfg.get("wait_for_start_before_rollout", True)
+            if train_env_cfg is not None
+            else True
         )
         self.eval_enable_offload = (
             eval_env_cfg.get("enable_offload", False)
@@ -484,6 +500,44 @@ class EnvWorker(Worker):
                 if self.eval_enable_offload:
                     self.eval_env_list[i].offload()
 
+    def _maybe_reset_train_envs_before_rollout(self, reason: str) -> None:
+        if (
+            not self.enable_train
+            or not self.cfg.env.train.auto_reset
+            or not self.reset_before_train_rollout
+            or not self._reset_before_next_train_bootstrap
+        ):
+            return
+
+        reset_options: dict[str, Any] = {
+            "reset_to_home": bool(self.reset_to_home_before_train_rollout),
+            "skip_wait_for_start": not bool(
+                self.wait_for_start_before_train_rollout
+            ),
+        }
+        for stage_id in range(self.stage_num):
+            self._logger.info(
+                "========== DOSW1 NEXT ROLLOUT RESET BEGIN stage=%s reason=%s "
+                "reset_to_home=%s wait_for_start=%s ==========",
+                stage_id,
+                reason,
+                reset_options["reset_to_home"],
+                not reset_options["skip_wait_for_start"],
+            )
+            extracted_obs, _ = self.env_list[stage_id].reset(options=reset_options)
+            if len(self.last_obs_list) <= stage_id:
+                self.last_obs_list.append(extracted_obs)
+                self.last_intervened_info_list.append((None, None))
+            else:
+                self.last_obs_list[stage_id] = extracted_obs
+                self.last_intervened_info_list[stage_id] = (None, None)
+            self._logger.info(
+                "========== DOSW1 NEXT ROLLOUT RESET DONE stage=%s ==========",
+                stage_id,
+            )
+
+        self._reset_before_next_train_bootstrap = False
+
     @Worker.timer("env_interact_step")
     def env_interact_step(
         self, chunk_actions: torch.Tensor, stage_id: int
@@ -500,6 +554,17 @@ class EnvWorker(Worker):
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
         )
+        target_chunks = int(self.model_cfg.num_action_chunks)
+        if (
+            getattr(chunk_actions, "ndim", 0) >= 3
+            and chunk_actions.shape[1] != target_chunks
+        ):
+            self._logger.warning(
+                "[DOSW1RLTrace] action chunk length mismatch: got %s, expected %s; truncating before env step",
+                chunk_actions.shape[1],
+                target_chunks,
+            )
+            chunk_actions = chunk_actions[:, :target_chunks]
         env_info = {}
 
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
@@ -1060,6 +1125,7 @@ class EnvWorker(Worker):
             )
 
     def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
+        self._maybe_reset_train_envs_before_rollout("train_bootstrap")
         env_outputs = self.bootstrap_step()
         self._send_train_bootstrap(rollout_channel, env_outputs)
         return env_outputs
@@ -1082,6 +1148,68 @@ class EnvWorker(Worker):
     ):
         for key, value in env_info.items():
             env_metrics.setdefault(key, []).append(value)
+
+    def _new_rollout_score_table(self) -> list[list[float]]:
+        return [
+            [0.0 for _ in range(self.train_num_envs_per_stage)]
+            for _ in range(self.stage_num)
+        ]
+
+    @staticmethod
+    def _accumulate_rollout_scores(
+        score_table: list[list[float]],
+        stage_id: int,
+        rewards: torch.Tensor | None,
+    ) -> None:
+        if rewards is None:
+            return
+        reward_sums = (
+            rewards.detach().float().cpu().reshape(rewards.shape[0], -1).sum(dim=1)
+        )
+        if len(score_table[stage_id]) < reward_sums.numel():
+            score_table[stage_id].extend(
+                [0.0] * (reward_sums.numel() - len(score_table[stage_id]))
+            )
+        for env_id, reward_sum in enumerate(reward_sums.tolist()):
+            score_table[stage_id][env_id] += float(reward_sum)
+
+    @staticmethod
+    def _format_rollout_scores(score_table: list[list[float]]) -> list[dict[str, Any]]:
+        return [
+            {"stage": stage_id, "env": env_id, "score": round(float(score), 4)}
+            for stage_id, stage_scores in enumerate(score_table)
+            for env_id, score in enumerate(stage_scores)
+        ]
+
+    @staticmethod
+    def _format_env_metric_summary(
+        env_metrics: dict[str, torch.Tensor],
+    ) -> dict[str, list[bool | int | float]]:
+        summary_keys = (
+            "return",
+            "reward",
+            "success_once",
+            "success_at_end",
+            "success_no_intervened",
+            "episode_len",
+            "intervened_once",
+            "intervened_steps",
+        )
+        summary: dict[str, list[bool | int | float]] = {}
+        for key in summary_keys:
+            value = env_metrics.get(key)
+            if value is None:
+                continue
+            tensor = torch.as_tensor(value).detach().cpu().reshape(-1)
+            if tensor.numel() == 0:
+                continue
+            if tensor.dtype == torch.bool:
+                summary[key] = [bool(v) for v in tensor.tolist()]
+            elif torch.is_floating_point(tensor):
+                summary[key] = [round(float(v), 4) for v in tensor.tolist()]
+            else:
+                summary[key] = [int(v) for v in tensor.tolist()]
+        return summary
 
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
@@ -1120,13 +1248,17 @@ class EnvWorker(Worker):
             for _ in range(self.stage_num)
         ]
         env_metrics = defaultdict(list)
+        rollout_scores = self._new_rollout_score_table()
 
         for epoch in range(self.rollout_epoch):
+            epoch_scores = self._new_rollout_score_table()
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
             else:
+                self._logger.info("[DOSW1RLTrace] epoch=%s bootstrap begin", epoch)
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
+                self._logger.info("[DOSW1RLTrace] epoch=%s bootstrap sent obs", epoch)
 
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
@@ -1154,8 +1286,21 @@ class EnvWorker(Worker):
                                 reward_model_output.detach().float().reshape(-1).cpu()
                             )
 
+                    self._logger.info(
+                        "[DOSW1RLTrace] epoch=%s chunk=%s stage=%s waiting rollout result",
+                        epoch,
+                        chunk_step_idx,
+                        stage_id,
+                    )
                     rollout_result = self.recv_rollout_results(
                         input_channel, mode="train"
+                    )
+                    self._logger.info(
+                        "[DOSW1RLTrace] epoch=%s chunk=%s stage=%s got rollout result action_shape=%s",
+                        epoch,
+                        chunk_step_idx,
+                        stage_id,
+                        getattr(getattr(rollout_result, "actions", None), "shape", None),
                     )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
@@ -1191,8 +1336,32 @@ class EnvWorker(Worker):
                             rollout_result.save_flags
                         )
 
+                    self._logger.info(
+                        "[DOSW1RLTrace] epoch=%s chunk=%s stage=%s env step begin",
+                        epoch,
+                        chunk_step_idx,
+                        stage_id,
+                    )
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
+                    )
+                    self._accumulate_rollout_scores(
+                        epoch_scores, stage_id, env_output.rewards
+                    )
+                    self._accumulate_rollout_scores(
+                        rollout_scores, stage_id, env_output.rewards
+                    )
+                    self._logger.info(
+                        "[DOSW1RLTrace] epoch=%s chunk=%s stage=%s env step done done_any=%s reward=%s",
+                        epoch,
+                        chunk_step_idx,
+                        stage_id,
+                        bool(env_output.dones.any().item())
+                        if env_output.dones is not None
+                        else None,
+                        env_output.rewards.detach().cpu().reshape(-1).tolist()
+                        if env_output.rewards is not None
+                        else None,
                     )
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
@@ -1242,7 +1411,17 @@ class EnvWorker(Worker):
                         env_metrics["reward_model_output"].append(
                             reward_model_output.detach().float().reshape(-1).cpu()
                         )
+                self._logger.info(
+                    "[DOSW1RLTrace] epoch=%s final stage=%s waiting rollout result",
+                    epoch,
+                    stage_id,
+                )
                 rollout_result = self.recv_rollout_results(input_channel, mode="train")
+                self._logger.info(
+                    "[DOSW1RLTrace] epoch=%s final stage=%s got rollout result",
+                    epoch,
+                    stage_id,
+                )
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
@@ -1276,6 +1455,14 @@ class EnvWorker(Worker):
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
+            self._logger.info(
+                "========== DOSW1 ROLLOUT EPOCH FINISHED epoch=%s/%s chunks=%s stages=%s scores=%s ==========",
+                epoch + 1,
+                self.rollout_epoch,
+                self.n_train_chunk_steps,
+                self.stage_num,
+                self._format_rollout_scores(epoch_scores),
+            )
 
         if not self.use_training_pipeline and actor_channel is not None:
             for stage_id in range(self.stage_num):
@@ -1288,6 +1475,18 @@ class EnvWorker(Worker):
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+
+        self._logger.info(
+            "========== DOSW1 ROLLOUT FINISHED scores=%s metrics=%s metric_keys=%s ==========",
+            self._format_rollout_scores(rollout_scores),
+            self._format_env_metric_summary(env_metrics),
+            sorted(env_metrics.keys()),
+        )
+        if self.reset_before_train_rollout and self.cfg.env.train.auto_reset:
+            self._reset_before_next_train_bootstrap = True
+            self._logger.info(
+                "========== DOSW1 NEXT ROLLOUT WILL RESET before bootstrap =========="
+            )
 
         return env_metrics
 

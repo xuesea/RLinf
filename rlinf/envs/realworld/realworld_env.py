@@ -212,7 +212,17 @@ class RealWorldEnv(gym.Env):
         obs = {}
 
         state = raw_obs["state"]
-        full_states = np.concatenate([state[k] for k in sorted(state)], axis=-1)
+        state_keys = list(self.cfg.get("state_keys", []))
+        if state_keys:
+            missing_keys = [key for key in state_keys if key not in state]
+            if missing_keys:
+                raise KeyError(
+                    f"Configured state_keys contain missing keys {missing_keys}; "
+                    f"available keys: {list(state)}"
+                )
+        else:
+            state_keys = sorted(state)
+        full_states = np.concatenate([state[k] for k in state_keys], axis=-1)
         obs["states"] = full_states
 
         frames = raw_obs["frames"]

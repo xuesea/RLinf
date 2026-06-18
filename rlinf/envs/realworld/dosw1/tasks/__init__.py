@@ -21,6 +21,9 @@ from gymnasium.envs.registration import register
 
 from rlinf.envs.realworld.common.wrappers import LeaderFollowerKeyboardIntervention
 from rlinf.envs.realworld.dosw1.tasks.pick import PickEnv as PickEnv
+from rlinf.envs.realworld.dosw1.tasks.stack_bowls import (
+    StackBowlsEnv as StackBowlsEnv,
+)
 
 
 def _maybe_apply_keyboard_intervention(
@@ -51,9 +54,35 @@ def create_dosw1_pick_env(
     return _maybe_apply_keyboard_intervention(env, env_cfg)
 
 
+def create_dosw1_stack_bowls_env(
+    override_cfg: dict[str, Any],
+    worker_info: Any,
+    hardware_info: Any,
+    env_idx: int,
+    env_cfg: Mapping[str, Any],
+) -> gym.Env:
+    env = StackBowlsEnv(
+        override_cfg=override_cfg,
+        worker_info=worker_info,
+        hardware_info=hardware_info,
+        env_idx=env_idx,
+    )
+    return _maybe_apply_keyboard_intervention(env, env_cfg)
+
+
 register(
     id="DOSW1PickEnv-v1",
     entry_point="rlinf.envs.realworld.dosw1.tasks:create_dosw1_pick_env",
 )
 
-__all__ = ["PickEnv", "create_dosw1_pick_env"]
+register(
+    id="DOSW1StackBowlsEnv-v1",
+    entry_point="rlinf.envs.realworld.dosw1.tasks:create_dosw1_stack_bowls_env",
+)
+
+__all__ = [
+    "PickEnv",
+    "StackBowlsEnv",
+    "create_dosw1_pick_env",
+    "create_dosw1_stack_bowls_env",
+]

@@ -424,10 +424,32 @@ class MultiStepRolloutWorker(Worker):
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
-        for _ in range(self.n_train_chunk_steps):
-            for _ in range(self.num_pipeline_stages):
+        for chunk_step_idx in range(self.n_train_chunk_steps):
+            for stage_id in range(self.num_pipeline_stages):
+                self._logger.info(
+                    "[DOSW1RLTrace] chunk=%s stage=%s waiting env obs",
+                    chunk_step_idx,
+                    stage_id,
+                )
                 env_output = await self.recv_env_output(input_channel)
+                self._logger.info(
+                    "[DOSW1RLTrace] chunk=%s stage=%s got env obs keys=%s",
+                    chunk_step_idx,
+                    stage_id,
+                    sorted(env_output.get("obs", {}).keys()),
+                )
+                self._logger.info(
+                    "[DOSW1RLTrace] chunk=%s stage=%s predict begin",
+                    chunk_step_idx,
+                    stage_id,
+                )
                 actions, result = self.predict(env_output["obs"])
+                self._logger.info(
+                    "[DOSW1RLTrace] chunk=%s stage=%s predict done action_shape=%s",
+                    chunk_step_idx,
+                    stage_id,
+                    getattr(actions, "shape", None),
+                )
 
                 save_flags = None
                 if result.get("expert_label_flag", False):
@@ -457,9 +479,27 @@ class MultiStepRolloutWorker(Worker):
                     ),
                 )
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
-        for _ in range(self.num_pipeline_stages):
+                self._logger.info(
+                    "[DOSW1RLTrace] chunk=%s stage=%s sent rollout result",
+                    chunk_step_idx,
+                    stage_id,
+                )
+        for stage_id in range(self.num_pipeline_stages):
+            self._logger.info(
+                "[DOSW1RLTrace] final stage=%s waiting env obs",
+                stage_id,
+            )
             env_output = await self.recv_env_output(input_channel)
+            self._logger.info(
+                "[DOSW1RLTrace] final stage=%s predict begin",
+                stage_id,
+            )
             actions, result = self.predict(env_output["obs"])
+            self._logger.info(
+                "[DOSW1RLTrace] final stage=%s predict done action_shape=%s",
+                stage_id,
+                getattr(actions, "shape", None),
+            )
 
             rollout_result = RolloutResult(
                 actions=actions,
@@ -469,6 +509,10 @@ class MultiStepRolloutWorker(Worker):
                 ),
             )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
+            self._logger.info(
+                "[DOSW1RLTrace] final stage=%s sent rollout result",
+                stage_id,
+            )
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -664,23 +708,45 @@ class MultiStepRolloutWorker(Worker):
                 return tuple(None for _ in sizes)
             return tuple(torch.split(tensor, sizes, dim=0))
 
+        def _split_forward_input_value(value: Any) -> tuple[Any, ...]:
+            if value is None:
+                return tuple(None for _ in sizes)
+            if isinstance(value, torch.Tensor):
+                return tuple(torch.split(value, sizes, dim=0))
+            if isinstance(value, np.ndarray):
+                split_indices = np.cumsum(sizes[:-1]).tolist()
+                return tuple(np.split(value, split_indices, axis=0))
+            if isinstance(value, list):
+                chunks = []
+                offset = 0
+                for size in sizes:
+                    chunks.append(value[offset : offset + size])
+                    offset += size
+                return tuple(chunks)
+            if isinstance(value, dict):
+                split_dicts = [dict() for _ in sizes]
+                for nested_key, nested_value in value.items():
+                    nested_splits = _split_forward_input_value(nested_value)
+                    for idx, nested_split in enumerate(nested_splits):
+                        if nested_split is not None:
+                            split_dicts[idx][nested_key] = nested_split
+                return tuple(split_dicts)
+            raise ValueError(
+                f"Unsupported forward_inputs value type for splitting: {type(value)}"
+            )
+
         split_actions = _split_optional_tensor(rollout_result.actions)
         split_prev_logprobs = _split_optional_tensor(rollout_result.prev_logprobs)
         split_prev_values = _split_optional_tensor(rollout_result.prev_values)
         split_bootstrap_values = _split_optional_tensor(rollout_result.bootstrap_values)
         split_save_flags = _split_optional_tensor(rollout_result.save_flags)
         split_versions = _split_optional_tensor(rollout_result.versions)
-        split_forward_inputs = (
-            [{} for _ in sizes]
-            if not rollout_result.forward_inputs
-            else [
-                {
-                    key: torch.split(value, sizes, dim=0)[idx]
-                    for key, value in rollout_result.forward_inputs.items()
-                }
-                for idx in range(len(sizes))
-            ]
-        )
+        split_forward_inputs = [dict() for _ in sizes]
+        for key, value in rollout_result.forward_inputs.items():
+            value_splits = _split_forward_input_value(value)
+            for idx, value_split in enumerate(value_splits):
+                if value_split is not None:
+                    split_forward_inputs[idx][key] = value_split
 
         return [
             RolloutResult(

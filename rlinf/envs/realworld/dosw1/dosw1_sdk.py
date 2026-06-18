@@ -30,10 +30,23 @@ if TYPE_CHECKING:
 
 try:
     from airbot_sdk.Airbot import AirbotRobot as _AirbotRobot
-    from airbot_sdk.configs.config import DosW1Config as _AirbotSDKConfig
 except ImportError:
     _AirbotRobot = None
+
+try:
+    from airbot_sdk.configs.config import DosW1Config as _AirbotSDKConfig
+except ImportError:
     _AirbotSDKConfig = None
+
+try:
+    from airbot_sdk.SimpleAirbot import SimpleAirbotRobot as _SimpleAirbotRobot
+except ImportError:
+    _SimpleAirbotRobot = None
+
+try:
+    from airbot_sdk.WholeAirbot import WholeAirbotRobot as _WholeAirbotRobot
+except ImportError:
+    _WholeAirbotRobot = None
 
 _CONTROL_LOOP_DT = 0.02
 _STATE_READY_TIMEOUT_S = 5.0
@@ -48,6 +61,7 @@ class DOSW1SDKAdapter:
         self._leader_arm_enabled = bool(config.enable_human_in_loop)
         self._connected = False
         self._robot: object | None = None
+        self._sdk_backend = "uninitialized"
 
     def connect(self) -> None:
         """Connect to follower and optional leader arms."""
@@ -55,12 +69,50 @@ class DOSW1SDKAdapter:
             self._connected = True
             return
 
-        if _AirbotRobot is None or _AirbotSDKConfig is None:
+        if (
+            _AirbotRobot is None
+            and _SimpleAirbotRobot is None
+            and _WholeAirbotRobot is None
+        ):
             raise ImportError(
                 "airbot_sdk is not installed. Install it or set is_dummy=True."
             )
 
         cfg = self._config
+        self._robot = self._create_robot(cfg)
+        try:
+            self._wait_for_initial_state()
+        except Exception:
+            self._shutdown_robot(self._robot)
+            self._robot = None
+            raise
+        self._connected = True
+        self._logger.info("[DOSW1SDK] Connected via %s.", self._sdk_backend)
+
+    def _create_robot(self, cfg: "DOSW1Config") -> object:
+        backend = str(getattr(cfg, "sdk_backend", "auto")).lower()
+        if backend not in {"auto", "new", "simple", "whole"}:
+            raise ValueError(f"Unsupported DOSW1 sdk_backend={backend!r}")
+
+        if backend in {"auto", "new"} and _AirbotRobot is not None:
+            if _AirbotSDKConfig is not None:
+                return self._create_new_airbot_robot(cfg)
+            if backend == "new":
+                raise ImportError(
+                    "airbot_sdk.configs.config.DosW1Config is unavailable."
+                )
+
+        if backend in {"auto", "simple"} and _SimpleAirbotRobot is not None:
+            return self._create_simple_airbot_robot(cfg)
+
+        if backend in {"auto", "whole"} and _WholeAirbotRobot is not None:
+            return self._create_whole_airbot_robot(cfg)
+
+        raise ImportError(
+            "No compatible AirBot SDK backend found. Tried new/simple/whole."
+        )
+
+    def _create_new_airbot_robot(self, cfg: "DOSW1Config") -> object:
         sdk_cfg = _AirbotSDKConfig()
         sdk_cfg.USE_CAM = False
         sdk_cfg.USE_CAR = False
@@ -75,7 +127,8 @@ class DOSW1SDKAdapter:
             cfg.right_lead_port,
         )
 
-        self._robot = _AirbotRobot(
+        self._sdk_backend = "new"
+        return _AirbotRobot(
             config_=sdk_cfg,
             left_lead_port=cfg.left_lead_port,
             left_lead_url=cfg.robot_url,
@@ -86,14 +139,60 @@ class DOSW1SDKAdapter:
             right_port=cfg.right_arm_port,
             right_url=cfg.robot_url,
         )
-        try:
-            self._wait_for_initial_state()
-        except Exception:
-            self._shutdown_robot(self._robot)
-            self._robot = None
-            raise
-        self._connected = True
-        self._logger.info("[DOSW1SDK] Connected.")
+
+    def _create_simple_airbot_robot(self, cfg: "DOSW1Config") -> object:
+        self._logger.info(
+            "[DOSW1SDK] Connecting via SimpleAirbotRobot "
+            "(url=%s, ports=%s/%s/%s/%s) ...",
+            cfg.robot_url,
+            cfg.left_arm_port,
+            cfg.right_arm_port,
+            cfg.left_lead_port,
+            cfg.right_lead_port,
+        )
+        self._sdk_backend = "simple"
+        return _SimpleAirbotRobot(
+            left_port=cfg.left_arm_port,
+            left_url=cfg.robot_url,
+            right_port=cfg.right_arm_port,
+            right_url=cfg.robot_url,
+            left_lead_port=cfg.left_lead_port,
+            left_lead_url=cfg.robot_url,
+            right_lead_port=cfg.right_lead_port,
+            right_lead_url=cfg.robot_url,
+        )
+
+    def _create_whole_airbot_robot(self, cfg: "DOSW1Config") -> object:
+        serials = list(cfg.camera_serials or [])
+        if len(serials) < 3:
+            raise ValueError(
+                "sdk_backend='whole' requires three camera_serials: "
+                "left, right, front."
+            )
+        self._logger.info(
+            "[DOSW1SDK] Connecting via WholeAirbotRobot "
+            "(url=%s, ports=%s/%s/%s/%s, camera_serials=%s) ...",
+            cfg.robot_url,
+            cfg.left_arm_port,
+            cfg.right_arm_port,
+            cfg.left_lead_port,
+            cfg.right_lead_port,
+            serials[:3],
+        )
+        self._sdk_backend = "whole"
+        return _WholeAirbotRobot(
+            serials[1],
+            serials[2],
+            serials[0],
+            left_port=cfg.left_arm_port,
+            left_url=cfg.robot_url,
+            right_port=cfg.right_arm_port,
+            right_url=cfg.robot_url,
+            left_lead_port=cfg.left_lead_port,
+            left_lead_url=cfg.robot_url,
+            right_lead_port=cfg.right_lead_port,
+            right_lead_url=cfg.robot_url,
+        )
 
     def disconnect(self) -> None:
         """Disconnect the wrapped AirbotRobot instance."""
@@ -247,10 +346,10 @@ class DOSW1SDKAdapter:
             left_ready = len(self._get_robot_joint(robot, "left_get_joint")) == 7
             right_ready = len(self._get_robot_joint(robot, "right_get_joint")) == 7
             lead_ready = True
-            if self._config.enable_human_in_loop:
-                lead_ready = (
-                    len(self._get_robot_joint(robot, "lead_left_get_joint")) == 7
-                    and len(self._get_robot_joint(robot, "lead_right_get_joint")) == 7
+        if self._config.enable_human_in_loop:
+            lead_ready = (
+                len(self._get_robot_joint(robot, "lead_left_get_joint")) == 7
+                and len(self._get_robot_joint(robot, "lead_right_get_joint")) == 7
                 )
             if left_ready and right_ready and lead_ready:
                 return
@@ -269,9 +368,27 @@ class DOSW1SDKAdapter:
             values = getter() if callable(getter) else []
         except Exception:
             return []
+        if DOSW1SDKAdapter._is_empty_values(values):
+            attr_name = {
+                "left_get_joint": "left_cur_joint",
+                "right_get_joint": "right_cur_joint",
+                "lead_left_get_joint": "left_lead_joint",
+                "lead_right_get_joint": "right_lead_joint",
+            }.get(getter_name)
+            if attr_name is not None:
+                values = getattr(robot, attr_name, [])
         if values is None:
             return []
         return list(values)
+
+    @staticmethod
+    def _is_empty_values(values: object) -> bool:
+        if values is None:
+            return True
+        try:
+            return len(values) == 0
+        except TypeError:
+            return False
 
     @staticmethod
     def _shutdown_robot(robot: object) -> None:
@@ -289,8 +406,5 @@ class DOSW1SDKAdapter:
         _disconnect_arm(getattr(robot, "left_arm", None))
         _disconnect_arm(getattr(robot, "right_arm", None))
 
-        config_ = getattr(robot, "config_", None)
-        use_lead_arms = bool(getattr(config_, "USE_LEAD_ARMS", False))
-        if use_lead_arms:
-            _disconnect_arm(getattr(robot, "left_lead_arm", None))
-            _disconnect_arm(getattr(robot, "right_lead_arm", None))
+        _disconnect_arm(getattr(robot, "left_lead_arm", None))
+        _disconnect_arm(getattr(robot, "right_lead_arm", None))

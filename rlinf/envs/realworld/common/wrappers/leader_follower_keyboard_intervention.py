@@ -57,6 +57,23 @@ class LeaderFollowerKeyboardIntervention(gym.Wrapper):
             return None
 
         if reset_phase:
+            if key == "r":
+                self._log_info(
+                    "[LeaderFollowerEnv] FreeTeleop reset requested -> HOME"
+                )
+                set_leader_follow = getattr(base_env, "_set_leader_follow_enabled", None)
+                go_home = getattr(base_env, "_go_to_home", None)
+                snapshot_fn = getattr(base_env, "snapshot_teleop_init", None)
+                if callable(set_leader_follow):
+                    set_leader_follow(enabled=False, source="keyboard_r_reset_phase")
+                setattr(base_env, "in_free_teleop", False)
+                if callable(go_home):
+                    go_home()
+                setattr(base_env, "in_free_teleop", True)
+                if callable(snapshot_fn):
+                    snapshot_fn()
+                if callable(set_leader_follow):
+                    set_leader_follow(enabled=True, source="keyboard_r_reset_phase")
             return None
 
         if control_mode is None:
@@ -71,12 +88,25 @@ class LeaderFollowerKeyboardIntervention(gym.Wrapper):
         if key == "r":
             self._log_info("[LeaderFollowerEnv] -> FreeTeleop (episode aborted)")
             setattr(base_env, "in_free_teleop", True)
-            return self._build_truncated_result()
+            cfg = getattr(base_env, "config", None)
+            return self._build_truncated_result(
+                reward=float(getattr(cfg, "manual_abort_reward", 0.0)),
+                terminated=bool(getattr(cfg, "manual_abort_terminated", False)),
+                truncated=bool(getattr(cfg, "manual_abort_truncated", True)),
+                success=False,
+            )
 
         if key == "d":
             self._log_info("[LeaderFollowerEnv] Manual done (episode saved)")
             setattr(base_env, "manual_done", True)
-            return self._build_truncated_result()
+            cfg = getattr(base_env, "config", None)
+            reward = float(getattr(cfg, "manual_done_reward", 0.0))
+            return self._build_truncated_result(
+                reward=reward,
+                terminated=bool(getattr(cfg, "manual_done_terminated", False)),
+                truncated=bool(getattr(cfg, "manual_done_truncated", True)),
+                success=bool(getattr(base_env, "manual_done", False)) or reward >= 1.0,
+            )
 
         if manual_episode_control_only and key in {"p", "t", "m"}:
             return None
@@ -107,7 +137,14 @@ class LeaderFollowerKeyboardIntervention(gym.Wrapper):
 
         return None
 
-    def _build_truncated_result(self):
+    def _build_truncated_result(
+        self,
+        *,
+        reward: float = 0.0,
+        terminated: bool = False,
+        truncated: bool = True,
+        success: bool = False,
+    ):
         base_env = self._base_env()
         obs_fn = getattr(base_env, "_get_observation", None)
         if not callable(obs_fn):
@@ -121,12 +158,13 @@ class LeaderFollowerKeyboardIntervention(gym.Wrapper):
         )
         return (
             observation,
-            0.0,
-            False,
-            True,
+            reward,
+            terminated,
+            truncated,
             {
                 "control_mode": control_mode_value,
                 "manual_done": bool(getattr(base_env, "manual_done", False)),
+                "success": success,
             },
         )
 
